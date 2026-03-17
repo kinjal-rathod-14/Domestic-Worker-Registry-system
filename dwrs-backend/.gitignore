@@ -1,0 +1,51 @@
+# Environment & secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.key
+keys/
+certs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+venv/
+env/
+.venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Node / Frontend
+node_modules/
+dist/
+.vite/
+*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+.docker/
+
+# Terraform state (use remote backend instead)
+*.tfstate
+*.tfstate.backup
+.terraform/

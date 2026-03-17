@@ -1,0 +1,116 @@
+# ============================================================
+# DWRS Backend — Python Dependencies
+# Python 3.11+ required
+# Install: pip install -r requirements.txt
+# ============================================================
+
+# --- Web Framework ---
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+python-multipart==0.0.9          # File uploads (photos)
+httpx==0.27.0                    # Async HTTP client (UIDAI, external APIs)
+starlette==0.37.2
+
+# --- Database ---
+sqlalchemy[asyncio]==2.0.30      # Async ORM
+asyncpg==0.29.0                  # Async PostgreSQL driver
+alembic==1.13.1                  # Database migrations
+psycopg2-binary==2.9.9           # Sync driver (Alembic migrations)
+pgvector==0.2.5                  # pgvector Python client (face embeddings)
+
+# --- Redis ---
+redis[hiredis]==5.0.4            # Redis async client
+aioredis==2.0.1
+
+# --- Authentication & Security ---
+python-jose[cryptography]==3.3.0 # JWT (RS256)
+passlib[bcrypt]==1.7.4           # Password hashing
+pyotp==2.9.0                     # TOTP / MFA
+cryptography==42.0.7             # Crypto primitives
+pycryptodome==3.20.0             # AES-256 encryption for PII fields
+
+# --- Validation & Serialisation ---
+pydantic==2.7.1                  # Request/response models
+pydantic-settings==2.2.1         # Settings from env vars
+email-validator==2.1.1           # Email validation
+
+# --- Kafka / Event Bus ---
+aiokafka==0.10.0                 # Async Kafka producer/consumer
+confluent-kafka==2.4.0           # Alternative: Confluent Kafka client
+
+# --- AWS SDK ---
+boto3==1.34.93                   # AWS services (S3, Rekognition, SQS, SES)
+botocore==1.34.93
+aioboto3==13.0.0                 # Async boto3 wrapper
+
+# --- Face Verification ---
+# AWS Rekognition used via boto3 (above)
+# Local dev fallback:
+Pillow==10.3.0                   # Image processing
+numpy==1.26.4                    # Numerical operations
+opencv-python-headless==4.9.0.80 # Face detection (dev/fallback only)
+face-recognition==1.3.0          # Local face comparison (dev only)
+
+# --- Geolocation ---
+geopy==2.4.1                     # Geocoding and distance calculations
+shapely==2.0.4                   # Polygon bounds (district boundary checks)
+
+# --- NLP / Fuzzy Matching ---
+rapidfuzz==3.9.0                 # Fast fuzzy string matching (name dedup)
+python-Levenshtein==0.25.1       # Levenshtein distance
+
+# --- ML / Anomaly Detection ---
+scikit-learn==1.4.2              # Isolation Forest (anomaly detection)
+joblib==1.4.2                    # Model serialisation
+pandas==2.2.2                    # Feature engineering
+
+# --- Elasticsearch / OpenSearch ---
+opensearch-py==2.6.0             # AWS OpenSearch client
+elasticsearch==8.13.0            # Elasticsearch client (dev)
+
+# --- Monitoring & Logging ---
+structlog==24.1.0                # Structured JSON logging
+sentry-sdk[fastapi]==2.2.1       # Error tracking
+prometheus-fastapi-instrumentator==2.2.0  # Prometheus metrics
+opentelemetry-api==1.24.0        # OpenTelemetry tracing
+opentelemetry-sdk==1.24.0
+opentelemetry-instrumentation-fastapi==0.45b0
+
+# --- Task Queue / Background Jobs ---
+celery[redis]==5.3.6             # Background tasks (trust score recompute)
+flower==2.0.1                    # Celery monitoring dashboard
+
+# --- Utilities ---
+python-dotenv==1.0.1             # .env file loading
+orjson==3.10.3                   # Fast JSON serialisation
+pendulum==3.0.0                  # Timezone-aware datetime handling
+ulid-py==1.1.0                   # ULID for ordered unique IDs
+phonenumbers==8.13.37            # Phone number validation (India)
+hashids==1.3.1                   # Human-readable ID encoding
+tenacity==8.3.0                  # Retry logic (UIDAI API calls)
+
+# --- SMS / OTP ---
+twilio==9.0.5                    # SMS OTP delivery
+# Alternative: msg91 (India-specific)
+
+# --- Testing ---
+pytest==8.2.0
+pytest-asyncio==0.23.6
+pytest-cov==5.0.0
+httpx==0.27.0                    # Test client (also listed above)
+factory-boy==3.3.0               # Test data factories
+faker==24.14.1                   # Fake data generation
+respx==0.21.1                    # Mock httpx requests
+freezegun==1.5.0                 # Freeze time in tests
+
+# --- Security Scanning (Dev) ---
+bandit==1.7.8                    # Python SAST scanner
+safety==3.2.0                    # Dependency vulnerability check
+detect-secrets==1.4.0            # Pre-commit secret detection
+
+# --- Code Quality ---
+black==24.4.2                    # Code formatter
+isort==5.13.2                    # Import sorter
+flake8==7.0.0                    # Linter
+mypy==1.10.0                     # Static type checking
+pre-commit==3.7.1                # Pre-commit hooks

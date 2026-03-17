@@ -1,0 +1,287 @@
+-- =============================================================
+-- DWRS Database Schema — PostgreSQL 15
+-- Run via: alembic upgrade head
+-- Or manually: psql -f schema.sql
+-- =============================================================
+
+-- Enable required extensions
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+CREATE EXTENSION IF NOT EXISTS "vector";           -- pgvector for face embeddings
+CREATE EXTENSION IF NOT EXISTS "pg_trgm";          -- Fuzzy name matching
+CREATE EXTENSION IF NOT EXISTS "postgis";          -- Optional: advanced geo queries
+CREATE EXTENSION IF NOT EXISTS "fuzzystrmatch";    -- Levenshtein / soundex
+
+-- =============================================================
+-- DISTRICTS
+-- =============================================================
+CREATE TABLE districts (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name                VARCHAR(100) NOT NULL,
+    state               VARCHAR(100) NOT NULL,
+    boundary_polygon    JSONB,           -- GeoJSON Polygon
+    created_at          TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- =============================================================
+-- USERS (all system actors)
+-- =============================================================
+CREATE TABLE users (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    username            VARCHAR(50) UNIQUE NOT NULL,
+    email               VARCHAR(200) UNIQUE,
+    password_hash       CHAR(60) NOT NULL,           -- bcrypt
+    totp_secret         VARCHAR(32),                 -- Base32 TOTP secret (encrypted)
+    role                VARCHAR(20) NOT NULL CHECK (role IN (
+                            'worker', 'employer', 'field_officer',
+                            'supervisor', 'admin', 'auditor'
+                        )),
+    district_id         UUID REFERENCES districts(id),   -- NULL for non-officer roles
+    is_suspended        BOOLEAN DEFAULT FALSE,
+    suspension_reason   TEXT,
+    created_at          TIMESTAMPTZ DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- =============================================================
+-- OFFICERS (extended profile for field officers)
+-- =============================================================
+CREATE TABLE officers (
+    id                  UUID PRIMARY KEY REFERENCES users(id),
+    badge_number        VARCHAR(20) UNIQUE NOT NULL,
+    district_id         UUID NOT NULL REFERENCES districts(id),
+    trust_score         DECIMAL(4,3) DEFAULT 1.000 CHECK (trust_score BETWEEN 0 AND 1),
+    registrations_count INT DEFAULT 0,
+    verifications_count INT DEFAULT 0,
+    anomaly_flags       INT DEFAULT 0,
+    confirmed_violations INT DEFAULT 0,
+    base_geo_lat        DECIMAL(10, 8),              -- Officer's usual work area
+    base_geo_lng        DECIMAL(11, 8),
+    is_suspended        BOOLEAN DEFAULT FALSE,
+    suspended_at        TIMESTAMPTZ,
+    suspended_reason    TEXT,
+    created_at          TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- =============================================================
+-- WORKERS
+-- =============================================================
+CREATE TABLE workers (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    -- PII stored encrypted; aadhaar stored only as hash for dedup
+    aadhaar_hash        CHAR(64) UNIQUE NOT NULL,    -- SHA-256(aadhaar + system_salt)
+    aadhaar_enc         BYTEA NOT NULL,              -- pgcrypto AES-256 encrypted
+    full_name_enc       BYTEA NOT NULL,              -- Encrypted
+    dob                 DATE NOT NULL,               -- Stored plaintext (not PII by itself)
+    gender              CHAR(1) CHECK (gender IN ('M', 'F', 'T')),
+    photo_url           TEXT,                        -- S3 pre-signed URL (generated on demand)
+    face_embedding      vector(512),                 -- pgvector for similarity search
+    mobile_hash         CHAR(64),                    -- NULL if no phone
+    mobile_enc          BYTEA,                       -- Encrypted mobile number
+    address             JSONB NOT NULL,
+    district_id         UUID REFERENCES districts(id),
+    risk_score          INT DEFAULT 0 CHECK (risk_score BETWEEN 0 AND 100),
+    risk_level          VARCHAR(6) CHECK (risk_level IN ('low', 'medium', 'high')),
+    status              VARCHAR(30) DEFAULT 'pending' CHECK (status IN (
+                            'pending', 'pending_verification', 'verified',
+                            'rejected', 'suspended', 'deleted'
+                        )),
+    registration_no     VARCHAR(20) UNIQUE,
+    created_at          TIMESTAMPTZ DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_workers_aadhaar_hash ON workers(aadhaar_hash);
+CREATE INDEX idx_workers_dob ON workers(dob);
+CREATE INDEX idx_workers_district ON workers(district_id);
+CREATE INDEX idx_workers_status ON workers(status);
+-- pgvector HNSW index for fast face similarity search
+CREATE INDEX idx_workers_face_embedding ON workers
+    USING hnsw (face_embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+
+-- =============================================================
+-- REGISTRATIONS
+-- =============================================================
+CREATE TABLE registrations (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    worker_id           UUID NOT NULL REFERENCES workers(id),
+    registration_mode   VARCHAR(25) NOT NULL CHECK (registration_mode IN (
+                            'self', 'assisted_officer', 'assisted_employer', 'offline'
+                        )),
+    officer_id          UUID REFERENCES users(id),
+    employer_id         UUID REFERENCES users(id),
+    geo_lat             DECIMAL(10, 8),
+    geo_lng             DECIMAL(11, 8),
+    geo_accuracy_meters DECIMAL(8, 2),
+    device_fingerprint  VARCHAR(100),
+    offline_batch_id    UUID,
+    offline_captured_at TIMESTAMPTZ,
+    consent_recorded    BOOLEAN NOT NULL DEFAULT FALSE,
+    consent_witness     VARCHAR(200),
+    created_at          TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_registrations_worker ON registrations(worker_id);
+CREATE INDEX idx_registrations_officer ON registrations(officer_id);
+CREATE INDEX idx_registrations_created ON registrations(created_at);
+CREATE INDEX idx_registrations_device ON registrations(device_fingerprint);
+
+-- =============================================================
+-- VERIFICATION RECORDS
+-- =============================================================
+CREATE TABLE verification_records (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    worker_id           UUID NOT NULL REFERENCES workers(id),
+    officer_id          UUID NOT NULL REFERENCES users(id),
+    face_match_score    DECIMAL(5, 4),
+    geo_match_passed    BOOLEAN,
+    geo_distance_km     DECIMAL(8, 3),
+    id_validation_passed BOOLEAN,
+    liveness_passed     BOOLEAN,
+    decision            VARCHAR(20) NOT NULL CHECK (decision IN ('approved', 'failed', 'escalated')),
+    notes               TEXT,
+    verified_at         TIMESTAMPTZ DEFAULT NOW(),
+    -- Constraint: verifier cannot be registrar (enforced in app layer + CHECK trigger)
+    CONSTRAINT different_officer CHECK (
+        officer_id != (
+            SELECT officer_id FROM registrations WHERE worker_id = verification_records.worker_id LIMIT 1
+        )
+    )
+);
+
+CREATE INDEX idx_verification_worker ON verification_records(worker_id);
+CREATE INDEX idx_verification_officer ON verification_records(officer_id);
+
+-- =============================================================
+-- RISK SCORES (versioned — new row on each recalculation)
+-- =============================================================
+CREATE TABLE risk_scores (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    entity_id           UUID NOT NULL,
+    entity_type         VARCHAR(20) NOT NULL CHECK (entity_type IN ('worker', 'officer')),
+    total_score         INT NOT NULL CHECK (total_score BETWEEN 0 AND 100),
+    risk_level          VARCHAR(6) NOT NULL,
+    rule_score          INT,
+    ml_anomaly_score    DECIMAL(5, 4),
+    rule_flags          JSONB,           -- Array of {rule_id, description, points, evidence}
+    explanation         TEXT,
+    computed_at         TIMESTAMPTZ DEFAULT NOW(),
+    computed_by         VARCHAR(30) DEFAULT 'system',
+    version             SERIAL
+);
+
+CREATE INDEX idx_risk_entity ON risk_scores(entity_id, entity_type);
+CREATE INDEX idx_risk_computed ON risk_scores(computed_at DESC);
+
+-- =============================================================
+-- OFFICER ACTIVITY LOGS
+-- =============================================================
+CREATE TABLE officer_activity_logs (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    officer_id          UUID NOT NULL REFERENCES users(id),
+    action_type         VARCHAR(40) NOT NULL,        -- registered_worker | verified_worker | login | etc.
+    entity_id           UUID,
+    geo_lat             DECIMAL(10, 8),
+    geo_lng             DECIMAL(11, 8),
+    session_id          UUID,
+    ip_address          INET,
+    extra_data          JSONB,
+    created_at          TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_officer_activity_officer ON officer_activity_logs(officer_id);
+CREATE INDEX idx_officer_activity_created ON officer_activity_logs(created_at DESC);
+
+-- =============================================================
+-- AUDIT RECORDS (IMMUTABLE — hash-chained)
+-- App user has INSERT only — no UPDATE, no DELETE
+-- =============================================================
+CREATE TABLE audit_records (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    actor_id            UUID NOT NULL,
+    actor_role          VARCHAR(20) NOT NULL,
+    action              VARCHAR(60) NOT NULL,
+    entity_type         VARCHAR(40) NOT NULL,
+    entity_id           UUID,
+    before_state        JSONB,
+    after_state         JSONB,
+    ip_address          INET,
+    session_id          UUID,
+    prev_hash           CHAR(64) NOT NULL,
+    record_hash         CHAR(64) NOT NULL UNIQUE,
+    created_at          TIMESTAMPTZ DEFAULT NOW()
+) WITH (autovacuum_enabled = false);
+
+-- Prevent any cleanup or modification
+REVOKE UPDATE, DELETE, TRUNCATE ON audit_records FROM PUBLIC;
+-- Only app_user can INSERT
+-- GRANT INSERT ON audit_records TO app_user;  -- Run as superuser
+
+CREATE INDEX idx_audit_actor ON audit_records(actor_id);
+CREATE INDEX idx_audit_entity ON audit_records(entity_type, entity_id);
+CREATE INDEX idx_audit_created ON audit_records(created_at DESC);
+
+-- =============================================================
+-- OFFLINE BATCHES
+-- =============================================================
+CREATE TABLE offline_batches (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    officer_id          UUID NOT NULL REFERENCES users(id),
+    device_fingerprint  VARCHAR(100),
+    records_count       INT DEFAULT 0,
+    synced_count        INT DEFAULT 0,
+    expired_count       INT DEFAULT 0,
+    captured_location   JSONB,
+    sync_started_at     TIMESTAMPTZ,
+    sync_completed_at   TIMESTAMPTZ,
+    status              VARCHAR(20) DEFAULT 'pending',
+    created_at          TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- =============================================================
+-- SUPERVISOR REVIEW QUEUE
+-- =============================================================
+CREATE TABLE review_queue (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    worker_id           UUID NOT NULL REFERENCES workers(id),
+    risk_score          INT NOT NULL,
+    risk_flags          JSONB,
+    assigned_to         UUID REFERENCES users(id),  -- Supervisor
+    status              VARCHAR(20) DEFAULT 'pending' CHECK (status IN (
+                            'pending', 'in_review', 'approved', 'rejected', 'escalated'
+                        )),
+    decision_reason     TEXT,
+    decided_at          TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- =============================================================
+-- MATERIALIZED VIEW: Officer Trust Metrics
+-- Refreshed every 6h by Celery beat task
+-- =============================================================
+CREATE MATERIALIZED VIEW officer_trust_metrics AS
+SELECT
+    o.id,
+    o.badge_number,
+    o.trust_score,
+    COUNT(r.id) FILTER (
+        WHERE r.created_at > NOW() - INTERVAL '7 days'
+    ) AS weekly_registrations,
+    COUNT(r.id) FILTER (
+        WHERE r.created_at > NOW() - INTERVAL '24 hours'
+    ) AS daily_registrations,
+    COUNT(vr.id) FILTER (
+        WHERE vr.decision = 'failed'
+    ) AS failed_verifications_on_registrants,
+    AVG(vr.face_match_score) AS avg_face_score_on_registrants,
+    o.anomaly_flags,
+    o.confirmed_violations,
+    o.is_suspended
+FROM officers o
+LEFT JOIN registrations r ON r.officer_id = o.id
+LEFT JOIN verification_records vr ON vr.worker_id = r.worker_id
+GROUP BY o.id, o.badge_number, o.trust_score, o.anomaly_flags,
+         o.confirmed_violations, o.is_suspended;
+
+CREATE UNIQUE INDEX ON officer_trust_metrics(id);
